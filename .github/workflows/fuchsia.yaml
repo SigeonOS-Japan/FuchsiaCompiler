@@ -1,0 +1,87 @@
+name: Build Fuchsia
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Runner label. Use a GitHub larger runner (150GB+ disk) - standard ubuntu-latest is too small"
+        required: true
+        default: "ubuntu-latest"
+      product_board:
+        description: "Product.board passed to 'fx set' (e.g. core.x64, workbench_eng.x64)"
+        required: true
+        default: "core.x64"
+      release:
+        description: "Build with --release"
+        type: boolean
+        default: false
+
+env:
+  FUCHSIA_ROOT: ${{ github.workspace }}/fuchsia
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner }}
+    # GitHub-hosted jobs are capped at 6 hours (360 min).
+    timeout-minutes: 360
+
+    steps:
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Check disk space
+        run: |
+          avail_gb=$(df --output=avail -BG "$GITHUB_WORKSPACE" | tail -1 | tr -dc '0-9')
+          echo "Free space: ${avail_gb} GB"
+          if [ "$avail_gb" -lt 110 ]; then
+            echo "::error::Only ${avail_gb} GB free; Fuchsia needs ~90+ GB to build. Use a larger runner with a bigger disk."
+            exit 1
+          fi
+
+      - name: Install prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y curl git unzip
+          git --version   # Fuchsia needs Git 2.28 or newer
+
+      - name: Download Fuchsia source (bootstrap)
+        working-directory: ${{ github.workspace }}
+        run: |
+          curl -s "https://fuchsia.googlesource.com/fuchsia/+/HEAD/scripts/bootstrap?format=TEXT" \
+            | base64 --decode | bash
+
+      - name: Add jiri and fx to PATH
+        run: echo "$FUCHSIA_ROOT/.jiri_root/bin" >> "$GITHUB_PATH"
+
+      - name: Verify tools
+        working-directory: ${{ env.FUCHSIA_ROOT }}
+        run: |
+          jiri help > /dev/null
+          fx help > /dev/null
+
+      - name: Configure build (fx set)
+        working-directory: ${{ env.FUCHSIA_ROOT }}
+        run: |
+          ARGS="${{ inputs.product_board }}"
+          if [ "${{ inputs.release }}" = "true" ]; then
+            ARGS="$ARGS --release"
+          fi
+          fx set $ARGS
+
+      - name: Build (fx build)
+        working-directory: ${{ env.FUCHSIA_ROOT }}
+        run: fx build
+
+      - name: Upload build metadata
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuchsia-build-output
+          path: |
+            ${{ env.FUCHSIA_ROOT }}/out/default/args.gn
+            ${{ env.FUCHSIA_ROOT }}/out/default/images.json
+          if-no-files-found: warn
